@@ -1,5 +1,5 @@
-## Adaptive MPC for Satellites Using Learning-Based Methods
-# Magnetorquer-only attitude control of satellite in unknown magnetic field.
+# Adaptive MPC for Satellites Using Learning-Based Methods
+## Magnetorquer-only attitude control of satellite in unknown magnetic field.
 <img width="2885" height="1675" alt="mag_only_block_diagram_old_cite" src="https://github.com/user-attachments/assets/a0d907a5-8160-452c-9026-cc691cc1f05e" />
 
 ## Prerequisites

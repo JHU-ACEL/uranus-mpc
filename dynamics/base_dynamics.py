@@ -132,7 +132,8 @@ class Dynamics(eqx.Module):
         state: jax.Array,
         control: jax.Array,
         t: float = 0.0,
-        external_param: Optional[jax.Array] = None
+        external_param: Optional[jax.Array] = None,
+        disturbance_force: Optional[jax.Array] = jnp.array([0])
         ) -> jnp.array:
         """
         Computes the time derivative of the state of the system.
@@ -156,5 +157,35 @@ class Dynamics(eqx.Module):
     def quaternion_projection(self, state):
       """ Projects quaternion onto SO(3) manifold (normalizes so norm(q) = 1. If dynamics don't have a quaternion, this done nothing"""
       return state
+
+    def get_error_coords(self, x, xbar):
+      return x - xbar
+    
+    def get_true_coords(self, dx, xbar):
+      return dx + xbar
+
+    # Attitude Jacobian, does nothing unless using MRP's in controller
+    def E(self, x: jax.Array):
+      nx = self.params["num_states"]
+      return jnp.eye(nx)
+
+    def linearize_and_discretize(self, nom_traj, nom_cntrl, ext_param, dt):
+      nx = self.params["num_states"]
+      def linearize_and_discretize_single(x,xp,u,ext_param):
+        A = jax.jacfwd(self.state_dot,argnums=0)(x,u,0.0,ext_param) #df/dx
+        B = jax.jacfwd(self.state_dot,argnums=1)(x,u,0.0,ext_param) # df/du
+  
+        # xp is x_k+1, transformation in "Planning with Attitude"
+        A = self.E(xp).T @ A @ self.E(x)
+        B = self.E(xp).T @ B
+        
+        Ad = jnp.eye(nx) + A*dt 
+        Bd = B*dt
+  
+        return Ad, Bd
+        
+      Ad, Bd = jax.vmap(linearize_and_discretize_single)(nom_traj[:-1], nom_traj[1:], nom_cntrl, ext_param)
+  
+      return Ad, Bd
 
       

@@ -11,21 +11,31 @@ __generated_with = "0.23.0"
 app = marimo.App(width="medium")
 
 
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    #
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    # Train magnetic field models for use in ```Spacecraft_Control.py```
+    Requires ```wandb```
+    """)
+    return
+
+
 @app.cell
 def _():
     import os
     # Prevent memory pre-allocation for flexible memory management
     os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
     os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.8' # Use 80% of GPU memory default is '.75'
-    #os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
-    #os.environ["XLA_FLAGS"] = "--xla_gpu_enable_instruction_fusion=false"
-    return
 
-
-@app.cell
-def _():
     import numpy as np
-
     import time
 
     import jax
@@ -48,11 +58,12 @@ def _():
 
     from dynamics.spacecraft_dynamics import SpacecraftDynamics
     from dynamics.orbit_dynamics import OrbitDynamics
-    from dynamics.orbit_dynamics_keplerian import OrbitDynamicsKeplerian
     from dynamics.planetary_params import Earth, Uranus, Neptune, Earth_low_order, Uranus_low_order
     from dynamics.magnetic_field import MagneticFieldModel
 
     return (
+        Earth,
+        Earth_low_order,
         MagneticFieldModel,
         OrbitDynamics,
         Trainer,
@@ -76,7 +87,7 @@ def _():
 
 @app.cell
 def _(jax):
-    jax.config.update("jax_enable_x64", False)
+    jax.config.update("jax_enable_x64", True)
     jax.config.update("jax_default_matmul_precision", "highest")
     jax.devices()
     return
@@ -96,15 +107,26 @@ def _(gc, jax, jeb):
     return
 
 
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Generate magnetic field data
+    """)
+    return
+
+
 @app.cell
-def _(Uranus, Uranus_low_order):
+def _(Earth, Earth_low_order, Uranus, Uranus_low_order):
     # Define parameters that must be consistent for orbit and spacecraft attitude dynamics
     dt = 0.1
-    # planet = Earth
-    # planet_coarse = Earth_low_order
     planet = Uranus
-    planet_coarse = Uranus_low_order
-    return dt, planet, planet_coarse
+    learn_coarse = False
+
+    if planet is Earth:
+        planet_coarse = Earth_low_order
+    elif planet is Uranus:
+        planet_coarse = Uranus_low_order
+    return dt, learn_coarse, planet, planet_coarse
 
 
 @app.cell
@@ -120,7 +142,7 @@ def _(
 ):
     # ==================== Orbit Dynamics =================== #
     orbit_dynamics = OrbitDynamics(Planet=planet)
-    orbit_system = TrajectoryGenerator(dynamics=orbit_dynamics, dt=dt, num_steps=1, noise_std=0.0)
+    orbit_system = TrajectoryGenerator(dynamics=orbit_dynamics, dt=dt)
 
     key_orbit = jrandom.key(1234)
     r_planet = planet.radius
@@ -131,7 +153,6 @@ def _(
     orbit_init_state_specs = [
                 {'dist': 'uniform', 'min': r_planet + 200, 'max': r_planet + 400}, # a (semimajor axis)
                 {'dist': 'uniform', 'min': 0.0, 'max': 0.2}, # eccentricity
-    #            {'dist': 'uniform', 'min': 70*jnp.pi/180, 'max': jnp.pi/2}, # inclination (near polar)
                 {'dist': 'uniform', 'min': 0, 'max': jnp.pi}, # inclination
                 {'dist': 'uniform', 'min': 0.0, 'max': 2 * jnp.pi}, # right ascension of the ascending node
                 {'dist': 'uniform', 'min': 0.0, 'max': 2 * jnp.pi}, # argument of periapsis
@@ -166,23 +187,31 @@ def _(MagneticFieldModel, planet, planet_coarse):
 def _(mag_model, mag_model_coarse, orbit_init_states):
     b_trajs = mag_model.compute_b_pcpf(r_pcpf=orbit_init_states[:,:3])
     b_trajs_coarse = mag_model_coarse.compute_b_pcpf(r_pcpf=orbit_init_states[:,:3])
-    return (b_trajs,)
+    return b_trajs, b_trajs_coarse
 
 
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    ## Learning/NN Training
+    ## Train FFNN Models
     """)
     return
 
 
 @app.cell
-def _(Trainer, b_trajs, jrandom, orbit_init_states_s):
-    # nn_inputs = orbit_init_states[:,:3] # [N_samples, 3] # Use XYZ coords as inputs
+def _(
+    Trainer,
+    b_trajs,
+    b_trajs_coarse,
+    jrandom,
+    learn_coarse,
+    orbit_init_states_s,
+):
     nn_inputs = orbit_init_states_s # [N_samples, 4] # Use 4D spherical coords as inputs
-    nn_outputs = b_trajs # [N_samples, 3] # Full order model
-    # nn_outputs = b_trajs_coarse # Coarse model
+    if learn_coarse:
+        nn_outputs = b_trajs_coarse # Coarse model
+    else:
+        nn_outputs = b_trajs # [N_samples, 3] # Full order model
     print(f"N_samples: {nn_inputs.shape[0]}")
     print(f"Input dim: {nn_inputs.shape[1]}")
     peak_lr = 3e-3
@@ -194,16 +223,36 @@ def _(Trainer, b_trajs, jrandom, orbit_init_states_s):
 
 
 @app.cell
-def _(trainer):
+def _(Earth, Uranus, learn_coarse, planet, trainer):
     # Define training params
     trainer.training_params['CHECKPOINT_AFTER'] = 100
     trainer.training_params['SAVEPOINT_AFTER'] = 200
-    trainer.training_params['FILENAME'] = 'models/uranus_b_4d.eqx'
-    trainer.training_params['RUN_NAME'] = "uranus-pcpf-4d-run7"
+    if planet is Earth:
+        if learn_coarse:
+            trainer.training_params['FILENAME'] = 'models/earth_b_4d_coarse.eqx'
+            trainer.training_params['RUN_NAME'] = "earth-coarse-run1"
+        else:
+            trainer.training_params['FILENAME'] = 'models/earth_b_4d.eqx'
+            trainer.training_params['RUN_NAME'] = "earth-run1"
+    elif planet is Uranus:
+        if learn_coarse:
+            trainer.training_params['FILENAME'] = 'models/uranus_b_4d_coarse.eqx'
+            trainer.training_params['RUN_NAME'] = "uranus-coarse-run1"
+        else:
+            trainer.training_params['FILENAME'] = 'models/uranus_b_4d.eqx'
+            trainer.training_params['RUN_NAME'] = "uranus-run1"
     #trainer.training_params['NUM_STEPS'] = 3000
 
     # Run training loop
     train_losses, val_losses = trainer.train()
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Evaluate learned models
+    """)
     return
 
 
@@ -241,31 +290,26 @@ def _(
 
 
 @app.cell
-def _(jax, load_model, orbit_traj_s):
+def _(Earth, Uranus, jax, load_model, orbit_traj_s, planet):
     # Use 4D spherical coords
-    # model_s = load_model(filename='models/earth_b_4d.eqx') # Earth
-    model_s, _ = load_model(filename='models/uranus_b_4d.eqx') # Uranus
-    b_test_s = jax.vmap(model_s)(orbit_traj_s) # PCPF coords
+    if planet is Earth:
+        model_s, _ = load_model(filename='models/earth_b_4d.eqx') # Earth
+        model_coarse, hyperparams = load_model(filename='models/earth_b_4d_coarse.eqx')
+    elif planet is Uranus:
+        model_s, _ = load_model(filename='models/uranus_b_4d.eqx') # Uranus
+        model_coarse, hyperparams = load_model(filename='models/uranus_b_4d_coarse.eqx')
 
-    # Load coarse model
-    # model_coarse = load_model(filename='models/earth_b_4d_coarse.eqx') # Earth
-    model_coarse, hyperparams = load_model(filename='models/uranus_b_4d_coarse.eqx') # Uranus
+    b_test_s = jax.vmap(model_s)(orbit_traj_s) # PCPF coords
     b_test_coarse = jax.vmap(model_coarse)(orbit_traj_s)
     return b_test_coarse, b_test_s, hyperparams, model_coarse
 
 
-@app.cell
-def _(hyperparams):
-    hyperparams
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Fine-tune model with last-layer update (proof of concept for online adaptation)
+    """)
     return
-
-
-app._unparsable_cell(
-    r"""
-    hyper_output_size = input_size*
-    """,
-    name="_"
-)
 
 
 @app.cell
@@ -300,19 +344,27 @@ def _(
 def _(jax, load_model, orbit_traj_s):
     model_updated,_j = load_model('models/uranus_b_4d_updated.eqx')
     b_updated2 = jax.vmap(model_updated)(orbit_traj_s)
+    return (b_updated2,)
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Compare magnetic field models
+    """)
     return
 
 
 @app.cell
-def _(b_test_coarse, b_test_s, b_traj, jnp, orbit_system):
+def _(b_test_coarse, b_test_s, b_traj, b_updated2, jnp, orbit_system):
     rmse_s = jnp.sqrt(jnp.mean((b_traj - b_test_s) ** 2, axis=0))
     print(f"Spherical: {jnp.mean(rmse_s)}")
 
     rmse_coarse = jnp.sqrt(jnp.mean((b_traj - b_test_coarse) ** 2, axis=0))
     print(f"Coarse: {jnp.mean(rmse_coarse)}")
 
-    # rmse_adj = jnp.sqrt(jnp.mean((b_traj - b_updated2) ** 2, axis=0))
-    # print(f"Adjusted: {jnp.mean(rmse_adj)}")
+    rmse_adj = jnp.sqrt(jnp.mean((b_traj - b_updated2) ** 2, axis=0))
+    print(f"Adjusted: {jnp.mean(rmse_adj)}")
 
     orbit_system.plot_traj(jnp.array([b_traj, b_test_s, b_test_coarse]),labels_states=["Bx [nT]","By [nT]","Bz [nT]"],legend=["True", "Learned Full-order", "Learned Low-order"])
     return

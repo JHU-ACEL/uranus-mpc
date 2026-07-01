@@ -10,13 +10,25 @@ from utils.propagate import TrajectoryGenerator
 
 import pdb
 
-class TVLQRController(Controller):
+import jax
+import jax.numpy as jnp
+import jax.random as jrandom
+import equinox as eqx
+from typing import Callable, Iterable, Tuple, Optional, Dict, Any
+
+from .base_controller import Controller
+from dynamics.base_dynamics import Dynamics
+from utils.propagate import TrajectoryGenerator
+
+import pdb
+    
+class FeedbackController(Controller):
   propagator: TrajectoryGenerator
   dynamics: Dynamics
+  cntrl_param_init: jax.Array
   
   # Parameters
   Q: jax.Array
-  Qf: jax.Array
   R: jax.Array
   control_limits: jax.Array
 
@@ -29,7 +41,7 @@ class TVLQRController(Controller):
     self.propagator = propagator
     self.dynamics = self.propagator.dynamics
     self.Q = Q
-    self.Qf = Qf.astype('float32')
+    self.cntrl_param_init = Qf
     self.R = R
     self.control_limits = control_limits
 
@@ -73,19 +85,17 @@ class TVLQRController(Controller):
       A = G @ A @ G.T
       B = G @ B
 
+      # Ad = jnp.eye(self.nx) + A*self.propagator.dt
       Ad = jnp.eye(self.nx-1) + A*self.propagator.dt 
       Bd = B*self.propagator.dt
 
-      
       return Ad, Bd
 
   @eqx.filter_jit
   def __call__(self, x0: jax.Array, u0: jax.Array, x_goal: jax.Array, external_dynamics_params: jax.Array, cntrl_param: jax.Array) -> Tuple[jax.Array, jax.Array]:
     """
-    TV LQR algorithm for tracking a nominal trajectory
+    Feedback controller for tracking a nominal trajectory
 
-    From  "MAGNETORQUER-ONLY ATTITUDE CONTROL OF SMALL SATELLITES USING TRAJECTORY OPTIMIZATION" - Gatherer
-    
     Returns:
         nominal state trajectory: (T+1, nx)
         nominal control trajectory: (T, nu)
@@ -101,18 +111,15 @@ class TVLQRController(Controller):
     q = x0[self.quat_start: self.quat_start + 4]
 
     # Calculate dx
-    omega_error = omega - omega_goal
+    omega_error = omega - omega_goal 
 
     # Quaternion error
     e1 = q_goal[0]*q[0] + q_goal[1:].T @ q[1:]
     e24 = q_goal[0]*q[1:] - q[0]*q_goal[1:] - jnp.cross(q_goal[1:],q[1:])
 
     phi = e24 / (1+ e1)
-
-    dx = jnp.concatenate((omega_error, 2*phi))
-
-    # For when states don't have quaternion (double integrator test)
-    #dx = x0 - x_goal
+    
+    dx = jnp.concatenate((2*phi, omega_error))
 
     # Ricatti equation
     eps = 1e-8*jnp.ones(R.shape) # to avoid singular matrix

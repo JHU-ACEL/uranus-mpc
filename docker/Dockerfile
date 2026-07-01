@@ -50,10 +50,14 @@ RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12
 
 #RUN echo 'debconf debconf/frontend select Noninteractive' | debconf-set-selections && ln -fs /usr/share/zoneinfo/US/Pacific /etc/localtime && apt-get install -y tzdata && dpkg-reconfigure --frontend noninteractive tzdata
 
-RUN python3.12 -m pip install -U pip && python3.12 -m pip install -U opencv-python numpy Pillow matplotlib scipy natsort h5py seaborn ipython jupyter jupyterlab matplotlib scipy marimo jax cvxpy equinox optax diffrax wandb
+RUN python3.12 -m pip install -U pip && python3.12 -m pip install -U opencv-python numpy Pillow matplotlib scipy natsort h5py seaborn ipython jupyter jupyterlab matplotlib scipy marimo jax cvxpy equinox optax diffrax wandb planetMagFields
 
 RUN python3.12 -m pip install --upgrade "jax[cuda12]"
 
+
+# Install moreau
+ENV MOREAU_LICENSE_KEY=
+RUN python3.12 -m pip install moreau[cuda12] --extra-index-url https://kkMeu-DhcjKJQMlfKzSqkxXqjEQndqjgE:@pypi.fury.io/optimalintellect/
 
 # Install casadi
 RUN python3.12 -m pip install casadi

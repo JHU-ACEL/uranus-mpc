@@ -1,12 +1,13 @@
 # Docker 
 
+### Modify Dockerfile
+You must modify the docker file to include your Moreau License Key.
+
 ### Build the Docker Container
 Use the `docker_build.sh` script to build the Docker image:
 ```bash
 ./docker/docker_build.sh docker/Dockerfile uranus-mpc:v1
 ```
-
-You must modify the moreau install step to use your specific access token.
 
 **Arguments:**
 - `dockerfile`: Path to the Dockerfile (e.g., `docker/Dockerfile`)

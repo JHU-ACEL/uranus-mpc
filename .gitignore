@@ -1,0 +1,7 @@
+__pycache__/
+__marimo__/
+c_generated_code/
+wandb/
+figures/
+data/
+*.json

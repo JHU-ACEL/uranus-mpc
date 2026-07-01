@@ -8,8 +8,6 @@ from typing import Callable, Iterable, Tuple, Optional, Dict, Any # TODO: maybe 
 from functools import partial
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
-import seaborn as sns
-
 
 import pdb
 
@@ -17,7 +15,7 @@ from dynamics.base_dynamics import Dynamics
 from controllers.base_controller import Controller
 from .coord_transforms import coord
 from .learning import adapt_mag_model
-from .plotting import plot_traj, plot_costs, plot_3D, plot_hist
+from .plotting import plot_traj, plot_costs, plot_3D, plot_kde, plot_violin_and_bar, create_stats_df, save_data_to_pd_df
 
 def sample_initial_states(batch_size, key, state_specs):
     """
@@ -59,35 +57,35 @@ def sample_initial_states(batch_size, key, state_specs):
 class TrajectoryGenerator(eqx.Module):
   dynamics: Dynamics
   dt: float
-  num_steps: int
-  noise_std: float
 
   def rk4_step(self, state, control, t, external_dynamics_param, key, noise_std):
-    def dynamics_wrapper(s):
-        return self.dynamics.state_dot(s, control, t, external_dynamics_param)
+    def dynamics_wrapper(s,k):
+      key, noise_key = jrandom.split(k)
+      u_noise = jrandom.normal(noise_key, shape=control.shape) * noise_std
+      return self.dynamics.state_dot(s, control, t, external_dynamics_param, u_noise)
 
     # Note: quaternion projection is just identity unless defined in Dynamics class
-    k1 = dynamics_wrapper(state)
-    k2 = dynamics_wrapper(self.dynamics.quaternion_projection(state + 0.5 * self.dt * k1))
-    k3 = dynamics_wrapper(self.dynamics.quaternion_projection(state + 0.5 * self.dt * k2))
-    k4 = dynamics_wrapper(self.dynamics.quaternion_projection(state + self.dt * k3))
+    k1 = dynamics_wrapper(state,key)
+    k2 = dynamics_wrapper(self.dynamics.quaternion_projection(state + 0.5 * self.dt * k1),key)
+    k3 = dynamics_wrapper(self.dynamics.quaternion_projection(state + 0.5 * self.dt * k2),key)
+    k4 = dynamics_wrapper(self.dynamics.quaternion_projection(state + self.dt * k3),key)
   
     dx = (self.dt/6.0) * (k1 + 2*k2 + 2*k3 + k4)
 
     # dx = self.dt*dynamics_wrapper(state) # euler
-  
-    noise = jrandom.normal(key, shape=state.shape) * noise_std * jnp.sqrt(self.dt)
-    
-    # TODO: make process noise integrated through dynamics (SDE)
-    return self.dynamics.quaternion_projection(state + dx + noise)
+
+    # key1, key = jrandom.split(key)
+    # noise = jrandom.normal(key, shape=state.shape) * noise_std * jnp.sqrt(self.dt)
+
+    return self.dynamics.quaternion_projection(state + dx)
 
   def generate_trajectory(
     self,
     initial_state: jax.Array, 
-    target_state: jax.Array, 
     key: jax.Array,
-    noise_std: Optional[jax.Array] = None,
-    num_steps: Optional[int] = None,
+    target_state: Optional[jax.Array] = None, 
+    noise_std: Optional[jax.Array] = 0.0,
+    num_steps: Optional[int] = 200,
     external_dynamics_params: Optional[jax.Array] = None, # Ex: Magnetic field [Bx, By, Bz] for each timestep
     external_dynamics_params_est: Optional[jax.Array] = None,
     high_level_controller: Optional[Controller] = None,
@@ -103,52 +101,60 @@ class TrajectoryGenerator(eqx.Module):
     Returns:
         trajectory: Shape (N + 1, nx)
         controls: Shape (N, nu)
-    """  
-    num_steps = num_steps or self.num_steps
-    noise_std = noise_std if noise_std is not None else jnp.full(self.dynamics.num_states, self.noise_std)
-
-    if external_dynamics_params is None:
-      external_dynamics_params = jnp.zeros((num_steps, 1))
+    """    
+    if high_level_controller is not None and high_level_controller.horizon >num_steps:
+      if external_dynamics_params is None:
+        external_dynamics_params = jnp.zeros((high_level_controller.horizon, 1))
+      else:
+        assert external_dynamics_params.shape[0] >= high_level_controller.horizon, \
+            f"external_dynamics_params sequence must have at least length {num_steps}"
+        # trim external params to num_steps length
+        ext_dyn_params = external_dynamics_params[:high_level_controller.horizon]
     else:
-      assert external_dynamics_params.shape[0] >= num_steps, \
-          f"external_dynamics_params sequence must have at least length {num_steps}"
+      if external_dynamics_params is None:
+        ext_dyn_params = jnp.zeros((num_steps, 1))
+      else:
+        assert external_dynamics_params.shape[0] >= num_steps, \
+            f"external_dynamics_params sequence must have at least length {num_steps}"
+        # trim external params to num_steps length
+        ext_dyn_params = external_dynamics_params[:num_steps]
 
     if control_sequence is not None:
       assert control_sequence.shape[0] == num_steps, \
           f"Control sequence must have length {num_steps}"
-      return self._generate_trajectory_seq(initial_state, target_state, key, noise_std, num_steps, external_dynamics_params,
+      return self._generate_trajectory_seq(initial_state, target_state, key, noise_std, num_steps, ext_dyn_params,
     control_sequence)
     elif low_level_controller and high_level_controller is not None:
       if adapt_freq is None:
         if external_dynamics_params_est is None:
-          return self._generate_trajectory_high_and_low_level_control(initial_state, target_state, key, noise_std, num_steps, external_dynamics_params, high_level_controller, low_level_controller, replan_freq)
+          return self._generate_trajectory_high_and_low_level_control(initial_state, target_state, key, noise_std, num_steps, ext_dyn_params, high_level_controller, low_level_controller, replan_freq)
         else:
-          return self._generate_trajectory_high_and_low_level_control_param_est(initial_state, target_state, key, noise_std, num_steps, external_dynamics_params, external_dynamics_params_est, high_level_controller, low_level_controller, replan_freq)
+          return self._generate_trajectory_high_and_low_level_control_param_est(initial_state, target_state, key, noise_std, num_steps, ext_dyn_params, external_dynamics_params_est[:num_steps], high_level_controller, low_level_controller, replan_freq)
       else:
-        return self._generate_trajectory_high_and_low_level_control_adapt(initial_state, target_state, key, noise_std, num_steps, external_dynamics_params, external_dynamics_params_est, high_level_controller, low_level_controller, replan_freq, adapt_freq, history)
-        
+        return self._generate_trajectory_high_and_low_level_control_adapt(initial_state, target_state, key, noise_std, num_steps, ext_dyn_params, external_dynamics_params_est[:num_steps], high_level_controller, low_level_controller, replan_freq, adapt_freq, history)
     elif low_level_controller is not None:
-      return self._generate_trajectory_low_level_control(initial_state, target_state, key, noise_std, num_steps, external_dynamics_params, low_level_controller)
+      if target_state.ndim < 2:
+        target_state = jnp.tile(target_state,(num_steps+1,1))
+      return self._generate_trajectory_low_level_control(initial_state, target_state, key, noise_std, num_steps, ext_dyn_params, low_level_controller)
     elif high_level_controller is not None:
       if adapt_freq is None:
         if external_dynamics_params_est is None:
-          return self._generate_trajectory_high_level_control(initial_state, target_state, key, noise_std, num_steps, external_dynamics_params, high_level_controller, replan_freq)
+          return self._generate_trajectory_high_level_control(initial_state, target_state, key, noise_std, num_steps, ext_dyn_params, high_level_controller, replan_freq)
         else:
-          return self._generate_trajectory_high_level_control_param_est(initial_state, target_state, key, noise_std, num_steps, external_dynamics_params, external_dynamics_params_est, high_level_controller, replan_freq)
+          return self._generate_trajectory_high_level_control_param_est(initial_state, target_state, key, noise_std, num_steps, ext_dyn_params, external_dynamics_params_est[:num_steps], high_level_controller, replan_freq)
       else:
-        return self._generate_trajectory_high_level_control_adapt(initial_state, target_state, key, noise_std, num_steps, external_dynamics_params, external_dynamics_params_est, high_level_controller, replan_freq, adapt_freq, history)
+        return self._generate_trajectory_high_level_control_adapt(initial_state, target_state, key, noise_std, num_steps, ext_dyn_params, external_dynamics_params_est[:num_steps], high_level_controller, replan_freq, adapt_freq, history)
     else:
       control_sequence = jnp.zeros((num_steps, self.dynamics.num_controls))
-      return self._generate_trajectory_seq(initial_state, target_state, key, noise_std, num_steps, external_dynamics_params,
-    control_sequence)
+      return self._generate_trajectory_seq(initial_state, target_state, key, noise_std, num_steps, ext_dyn_params, control_sequence)
 
   def generate_trajectory_batch(self,
                                 initial_states: jax.Array,
-                                target_states: jax.Array,
                                 key: jax.Array,
                                 batch_size: int,
-                                noise_std: Optional[jax.Array] = None,
-                                num_steps: Optional[int] = None,
+                                target_states: Optional[jax.Array] = None,
+                                noise_std: Optional[jax.Array] = 0.0,
+                                num_steps: Optional[int] = 200,
                                 external_dynamics_params: Optional[jax.Array] = None,
                                 external_dynamics_params_est: Optional[jax.Array] = None,
                                 high_level_controller: Optional[Controller] = None,
@@ -160,8 +166,6 @@ class TrajectoryGenerator(eqx.Module):
                                 chunk_size: Optional[int] = 0):
       
     keys = jrandom.split(key, batch_size)
-    num_steps = num_steps or self.num_steps
-    noise_std = noise_std if noise_std is not None else jnp.full(self.dynamics.num_states, self.noise_std)
     actual_chunk_size = chunk_size or batch_size
 
     # Broadcast scalars/unbatched arrays to [batch_size, ...]
@@ -205,6 +209,8 @@ class TrajectoryGenerator(eqx.Module):
                 high_level_controller, low_level_controller, replan_freq, adapt_freq, history)
             
         elif low_level_controller is not None:
+            if target.ndim < 2:
+              target = jnp.tile(target,(num_steps+1,1))
             return self._generate_trajectory_low_level_control(
                 init, target, k, noise_std, num_steps, extern, low_level_controller
             )
@@ -225,7 +231,7 @@ class TrajectoryGenerator(eqx.Module):
             return self._generate_trajectory_seq(init, target, k, noise_std, num_steps, extern, c_seq)
 
     # Executes actual_chunk_size items in parallel using vmap internally, then loops through the rest of the batch.
-    # return jax.vmap(map_fn)((b_init, b_target, keys, b_extern, b_extern_est, b_ctrl_seq))
+    #return jax.vmap(map_fn)((b_init, b_target, keys, b_extern, b_extern_est, b_ctrl_seq))
     return jax.lax.map(map_fn, (b_init, b_target, keys, b_extern, b_extern_est, b_ctrl_seq), batch_size=actual_chunk_size)
 
   @eqx.filter_jit
@@ -283,21 +289,25 @@ class TrajectoryGenerator(eqx.Module):
         trajectory: Shape (N + 1, nx)
         controls: Shape (N, nu)
     """  
-    scan_inputs = external_dynamics_params
-    
+    ext_params = external_dynamics_params[:target_state.shape[0]-1]
+    nominal_traj = target_state
+    nominal_cntrl = jnp.zeros((target_state.shape[0]-1, self.dynamics.num_controls))
+
+    scan_inputs = ext_params
+
     def scan_step(carry, scan_input):
       state, key, i, cntrl_param = carry
       extern_dyn_param = scan_input
       t_current = i * self.dt
-      key, rk4_key = jrandom.split(key)
+      key, rk4_key, cntrl_key = jrandom.split(key,3)
       u0 = jnp.zeros((self.dynamics.num_controls,))
-      control_input, cntrl_param = low_level_controller(state, u0, target_state, extern_dyn_param, cntrl_param)
+      # control_input, cntrl_param = low_level_controller(state, target_state, cntrl_key, external_dynamics_params, nominal_traj, nominal_cntrl, cntrl_param)
+      control_input, cntrl_param = low_level_controller(state, u0, target_state[i], extern_dyn_param, cntrl_param)
       next_state = self.rk4_step(state, control_input, t_current, extern_dyn_param, rk4_key, noise_std) 
       return (next_state, key, i+1, cntrl_param), (state, control_input)
 
     # Run scan
-    # Init cntrl param for TV LQR
-    cntrl_param = low_level_controller.Qf
+    cntrl_param = low_level_controller.cntrl_param_init
     init_carry = (initial_state, key, 0, cntrl_param)
     (final_state, final_key, _, _), (trajectory, controls) = jax.lax.scan(scan_step, init_carry, scan_inputs)
   
@@ -335,7 +345,10 @@ class TrajectoryGenerator(eqx.Module):
         return high_level_controller(*operand)
         
       def no_update(operand):
-        *_ ,nominal_traj, nominal_cntrl = operand       
+        *_ ,nominal_traj, nominal_cntrl = operand
+        # Shift nominal trajectory and nominal cntrl
+        nominal_traj = jnp.concatenate((nominal_traj[1:],jnp.expand_dims(nominal_traj[-1],axis=0)),axis=0)
+        nominal_cntrl = jnp.concatenate((nominal_cntrl[1:],jnp.expand_dims(nominal_cntrl[-1],axis=0)),axis=0)
         return nominal_traj, nominal_cntrl
 
       params_dim = external_dynamics_params.shape[1]
@@ -354,22 +367,24 @@ class TrajectoryGenerator(eqx.Module):
         no_update,
         operand=(state, target_state, cntrl_key, dyn_params_slice, nominal_traj, nominal_cntrl)
       )
-      control_input = nominal_cntrl[i % replan_freq]
+      #control_input = nominal_cntrl[i % replan_freq]
+      control_input = nominal_cntrl[0] # always 0 because no_update fn shifts
       next_state = self.rk4_step(state, control_input, t_current, dyn_params_slice[0], rk4_key, noise_std)
       return (next_state, key, i+1, nominal_traj, nominal_cntrl), (state, control_input)
       
     # Run scan
-    init_nom_traj = jnp.tile(target_state,(high_level_controller.horizon+1,1))
-    init_nom_cntrl = jnp.zeros((high_level_controller.horizon, self.dynamics.num_controls))
+    init_nom_traj = jnp.tile(initial_state,(high_level_controller.horizon+1,1))
+    #t = jnp.linspace(0, self.dt*high_level_controller.horizon, high_level_controller.horizon + 1).reshape(-1, 1)  # Shape: (horizon+1, 1)
+    #init_nom_traj = initial_state + t * (target_state - initial_state) 
     key, init_cntrl_key = jrandom.split(key)
-    #init_nom_cntrl = 0.001*jrandom.normal(init_cntrl_key, shape=((high_level_controller.horizon, self.dynamics.num_controls)))
+    init_nom_cntrl = 0.001*jrandom.normal(init_cntrl_key, shape=((high_level_controller.horizon, self.dynamics.num_controls)))
     init_carry = (initial_state, key, 0, init_nom_traj, init_nom_cntrl)
     (final_state, final_key, _, nominal_traj, nominal_cntrl), (trajectory, controls) = jax.lax.scan(scan_step, init_carry, length=num_steps)
   
     # Add final state to end of trajectory
     trajectory = jnp.vstack([trajectory, final_state[None, :]])
   
-    return trajectory, controls, nominal_traj, nominal_cntrl
+    return trajectory, controls#, nominal_traj, nominal_cntrl
 
   @eqx.filter_jit
   def _generate_trajectory_high_and_low_level_control(
@@ -402,34 +417,40 @@ class TrajectoryGenerator(eqx.Module):
         return high_level_controller(*operand)
         
       def no_update(operand):
-        *_ ,nominal_traj, nominal_cntrl = operand    
+        *_ ,nominal_traj, nominal_cntrl = operand 
+        # Shift nominal trajectory and nominal cntrl
+        nominal_traj = jnp.concatenate((nominal_traj[1:],jnp.expand_dims(nominal_traj[-1],axis=0)),axis=0)
+        nominal_cntrl = jnp.concatenate((nominal_cntrl[1:],jnp.expand_dims(nominal_cntrl[-1],axis=0)),axis=0)
         return nominal_traj, nominal_cntrl
 
       params_dim = external_dynamics_params.shape[1]
       horizon = high_level_controller.horizon
 
-      # True magnetic field
+      # True magnetic field in PCI coords
       dyn_params_slice = jax.lax.dynamic_slice(
           external_dynamics_params,
           (i, 0),
           (horizon, params_dim)
       )
-      
+
       nominal_traj, nominal_cntrl = jax.lax.cond(
         i % replan_freq == 0,
         controller_wrapper,
         no_update,
         operand=(state, target_state, cntrl_key, dyn_params_slice, nominal_traj, nominal_cntrl)
       )
-      control_input, cntrl_param = low_level_controller(state, nominal_cntrl[i % replan_freq], nominal_traj[i % replan_freq], dyn_params_slice[i % replan_freq], cntrl_param)
+      # control_input, cntrl_param = low_level_controller(state, target_state, cntrl_key, dyn_params_slice, nominal_traj, nominal_cntrl, cntrl_param)
+      control_input, cntrl_param = low_level_controller(state, nominal_cntrl[0], nominal_traj[0], dyn_params_slice[i % replan_freq], cntrl_param)
       next_state = self.rk4_step(state, control_input, t_current, dyn_params_slice[0], rk4_key, noise_std)
       return (next_state, key, i+1, cntrl_param, nominal_traj, nominal_cntrl, mag_model), (state, control_input)
       
     # Run scan
-    init_nom_traj = jnp.tile(target_state,(high_level_controller.horizon+1,1))
+    init_nom_traj = jnp.tile(initial_state,(high_level_controller.horizon+1,1))
+    #t = jnp.linspace(0, self.dt*high_level_controller.horizon, high_level_controller.horizon + 1).reshape(-1, 1)  # Shape: (horizon+1, 1)
+    #init_nom_traj = initial_state + t * (target_state - initial_state) 
     key, init_cntrl_key = jrandom.split(key)
-    init_nom_cntrl = 0.01*jrandom.normal(init_cntrl_key, shape=((high_level_controller.horizon, self.dynamics.num_controls)))
-    init_cntrl_param = low_level_controller.Qf
+    init_nom_cntrl = 0.001*jrandom.normal(init_cntrl_key, shape=((high_level_controller.horizon, self.dynamics.num_controls)))
+    init_cntrl_param = low_level_controller.cntrl_param_init
     init_carry = (initial_state, key, 0, init_cntrl_param, init_nom_traj, init_nom_cntrl, self.dynamics.mag_model)
     
     (final_state, final_key, _, _, nominal_traj, nominal_cntrl, mag_model), (trajectory, controls) = jax.lax.scan(scan_step, init_carry, length=num_steps)
@@ -437,7 +458,7 @@ class TrajectoryGenerator(eqx.Module):
     # Add final state to end of trajectory
     trajectory = jnp.vstack([trajectory, final_state[None, :]])
   
-    return trajectory, controls, nominal_traj, nominal_cntrl
+    return trajectory, controls #, nominal_traj, nominal_cntrl
 
   @eqx.filter_jit
   def _generate_trajectory_high_and_low_level_control_param_est(
@@ -471,14 +492,17 @@ class TrajectoryGenerator(eqx.Module):
         return high_level_controller(*operand)
         
       def no_update(operand):
-        *_ ,nominal_traj, nominal_cntrl = operand    
+        *_ ,nominal_traj, nominal_cntrl = operand
+        # Shift nominal trajectory and nominal cntrl
+        nominal_traj = jnp.concatenate((nominal_traj[1:],jnp.expand_dims(nominal_traj[-1],axis=0)),axis=0)
+        nominal_cntrl = jnp.concatenate((nominal_cntrl[1:],jnp.expand_dims(nominal_cntrl[-1],axis=0)),axis=0)
         return nominal_traj, nominal_cntrl
 
       params_dim = external_dynamics_params.shape[1]
       est_params_dim = external_dynamics_params_est.shape[1]
       horizon = high_level_controller.horizon
 
-      # True magnetic field
+      # True magnetic field in PCI coords
       dyn_params_slice = jax.lax.dynamic_slice(
           external_dynamics_params,
           (i, 0),
@@ -510,15 +534,16 @@ class TrajectoryGenerator(eqx.Module):
         no_update,
         operand=(state, target_state, cntrl_key, dyn_params_est_slice, nominal_traj, nominal_cntrl)
       )
-      control_input, cntrl_param = low_level_controller(state, nominal_cntrl[i % replan_freq], nominal_traj[i % replan_freq], dyn_params_slice[i % replan_freq], cntrl_param)
+      # control_input, cntrl_param = low_level_controller(state, target_state, cntrl_key, dyn_params_slice, nominal_traj, nominal_cntrl, cntrl_param)
+      control_input, cntrl_param = low_level_controller(state, nominal_cntrl[0], nominal_traj[0], dyn_params_slice[i % replan_freq], cntrl_param)
       next_state = self.rk4_step(state, control_input, t_current, dyn_params_slice[0], rk4_key, noise_std)
       return (next_state, key, i+1, cntrl_param, nominal_traj, nominal_cntrl, mag_model), (state, control_input)
       
     # Run scan
-    init_nom_traj = jnp.tile(target_state,(high_level_controller.horizon+1,1))
+    init_nom_traj = jnp.tile(initial_state,(high_level_controller.horizon+1,1))
     key, init_cntrl_key = jrandom.split(key)
-    init_nom_cntrl = 0.01*jrandom.normal(init_cntrl_key, shape=((high_level_controller.horizon, self.dynamics.num_controls)))
-    init_cntrl_param = low_level_controller.Qf
+    init_nom_cntrl = 0.001*jrandom.normal(init_cntrl_key, shape=((high_level_controller.horizon, self.dynamics.num_controls)))
+    init_cntrl_param = low_level_controller.cntrl_param_init
     init_carry = (initial_state, key, 0, init_cntrl_param, init_nom_traj, init_nom_cntrl, self.dynamics.mag_model)
     
     (final_state, final_key, _, _, nominal_traj, nominal_cntrl, mag_model), (trajectory, controls) = jax.lax.scan(scan_step, init_carry, length=num_steps)
@@ -526,7 +551,7 @@ class TrajectoryGenerator(eqx.Module):
     # Add final state to end of trajectory
     trajectory = jnp.vstack([trajectory, final_state[None, :]])
   
-    return trajectory, controls, nominal_traj, nominal_cntrl
+    return trajectory, controls#, nominal_traj, nominal_cntrl
 
   @eqx.filter_jit
   def _generate_trajectory_high_level_control_param_est(
@@ -558,7 +583,10 @@ class TrajectoryGenerator(eqx.Module):
         return high_level_controller(*operand)
         
       def no_update(operand):
-        *_ ,nominal_traj, nominal_cntrl = operand       
+        *_ ,nominal_traj, nominal_cntrl = operand
+        # Shift nominal trajectory and nominal cntrl
+        nominal_traj = jnp.concatenate((nominal_traj[1:],jnp.expand_dims(nominal_traj[-1],axis=0)),axis=0)
+        nominal_cntrl = jnp.concatenate((nominal_cntrl[1:],jnp.expand_dims(nominal_cntrl[-1],axis=0)),axis=0)
         return nominal_traj, nominal_cntrl
 
       params_dim = external_dynamics_params.shape[1]
@@ -595,22 +623,21 @@ class TrajectoryGenerator(eqx.Module):
         no_update,
         operand=(state, target_state, cntrl_key, dyn_params_est_slice, nominal_traj, nominal_cntrl)
       )
-      control_input = nominal_cntrl[i % replan_freq]
+      control_input = nominal_cntrl[0]
       next_state = self.rk4_step(state, control_input, t_current, dyn_params_slice[0], rk4_key, noise_std)
       return (next_state, key, i+1, nominal_traj, nominal_cntrl), (state, control_input)
       
     # Run scan
-    init_nom_traj = jnp.tile(target_state,(high_level_controller.horizon+1,1))
-    #init_nom_cntrl = jnp.zeros((high_level_controller.horizon, self.dynamics.num_controls))
+    init_nom_traj = jnp.tile(initial_state,(high_level_controller.horizon+1,1))
     key, init_cntrl_key = jrandom.split(key)
-    init_nom_cntrl = 0.01*jrandom.normal(init_cntrl_key, shape=((high_level_controller.horizon, self.dynamics.num_controls)))
+    init_nom_cntrl = 0.001*jrandom.normal(init_cntrl_key, shape=((high_level_controller.horizon, self.dynamics.num_controls)))
     init_carry = (initial_state, key, 0, init_nom_traj, init_nom_cntrl)
     (final_state, final_key, _, nominal_traj, nominal_cntrl), (trajectory, controls) = jax.lax.scan(scan_step, init_carry, length=num_steps)
   
     # Add final state to end of trajectory
     trajectory = jnp.vstack([trajectory, final_state[None, :]])
   
-    return trajectory, controls, nominal_traj, nominal_cntrl
+    return trajectory, controls#, nominal_traj, nominal_cntrl
 
   @eqx.filter_jit
   def _generate_trajectory_high_level_control_adapt(
@@ -638,13 +665,16 @@ class TrajectoryGenerator(eqx.Module):
     def scan_step(carry, _):
       state, key, i, nominal_traj, nominal_cntrl = carry
       t_current = i * self.dt
-      key, rk4_key, cntrl_key = jrandom.split(key, 3)
+      key, rk4_key, cntrl_key, mag_key = jrandom.split(key, 4)
 
       def controller_wrapper(operand):
         return high_level_controller(*operand)
         
       def no_update(operand):
-        *_ ,nominal_traj, nominal_cntrl = operand       
+        *_ ,nominal_traj, nominal_cntrl = operand
+        # Shift nominal trajectory and nominal cntrl
+        nominal_traj = jnp.concatenate((nominal_traj[1:],jnp.expand_dims(nominal_traj[-1],axis=0)),axis=0)
+        nominal_cntrl = jnp.concatenate((nominal_cntrl[1:],jnp.expand_dims(nominal_cntrl[-1],axis=0)),axis=0)
         return nominal_traj, nominal_cntrl
 
       params_dim = external_dynamics_params.shape[1]
@@ -665,9 +695,9 @@ class TrajectoryGenerator(eqx.Module):
       )
 
       ############ Adaptation ##################
-      # # For now, just assume perfect knowledge with no noise
+      # Simulate noisy magnetometer measurement
       magnetometer_measurements = jax.lax.dynamic_slice(
-        external_dynamics_params,
+        external_dynamics_params + jrandom.normal(mag_key, shape=external_dynamics_params.shape) * 1e4,
         (i-history, 0), # uses history (no knowledge of future mag measurements)
         (history, params_dim),
         allow_negative_indices=False # will throw error if cond. not set up correctly which would allow it to use future measurements
@@ -716,22 +746,21 @@ class TrajectoryGenerator(eqx.Module):
         no_update,
         operand=(state, target_state, cntrl_key, dyn_params_est_slice, nominal_traj, nominal_cntrl)
       )
-      control_input = nominal_cntrl[i % replan_freq]
+      control_input = nominal_cntrl[0]
       next_state = self.rk4_step(state, control_input, t_current, dyn_params_slice[0], rk4_key, noise_std)
       return (next_state, key, i+1, nominal_traj, nominal_cntrl), (state, control_input)
       
     # Run scan
-    init_nom_traj = jnp.tile(target_state,(high_level_controller.horizon+1,1))
-    #init_nom_cntrl = jnp.zeros((high_level_controller.horizon, self.dynamics.num_controls))
+    init_nom_traj = jnp.tile(initial_state,(high_level_controller.horizon+1,1))
     key, init_cntrl_key = jrandom.split(key)
-    init_nom_cntrl = 0.01*jrandom.normal(init_cntrl_key, shape=((high_level_controller.horizon, self.dynamics.num_controls)))
+    init_nom_cntrl = 0.001*jrandom.normal(init_cntrl_key, shape=((high_level_controller.horizon, self.dynamics.num_controls)))
     init_carry = (initial_state, key, 0, init_nom_traj, init_nom_cntrl)
     (final_state, final_key, _, nominal_traj, nominal_cntrl), (trajectory, controls) = jax.lax.scan(scan_step, init_carry, length=num_steps)
   
     # Add final state to end of trajectory
     trajectory = jnp.vstack([trajectory, final_state[None, :]])
   
-    return trajectory, controls, nominal_traj, nominal_cntrl
+    return trajectory, controls#, nominal_traj, nominal_cntrl
       
   @eqx.filter_jit
   def _generate_trajectory_high_and_low_level_control_adapt(
@@ -761,13 +790,16 @@ class TrajectoryGenerator(eqx.Module):
     def scan_step(carry, _):
       state, key, i, cntrl_param, nominal_traj, nominal_cntrl, mag_model = carry
       t_current = i * self.dt
-      key, rk4_key, cntrl_key = jrandom.split(key, 3)
+      key, rk4_key, cntrl_key, mag_key = jrandom.split(key, 4)
 
       def controller_wrapper(operand):
         return high_level_controller(*operand)
         
       def no_update(operand):
-        *_ ,nominal_traj, nominal_cntrl = operand    
+        *_ ,nominal_traj, nominal_cntrl = operand
+        # Shift nominal trajectory and nominal cntrl
+        nominal_traj = jnp.concatenate((nominal_traj[1:],jnp.expand_dims(nominal_traj[-1],axis=0)),axis=0)
+        nominal_cntrl = jnp.concatenate((nominal_cntrl[1:],jnp.expand_dims(nominal_cntrl[-1],axis=0)),axis=0)
         return nominal_traj, nominal_cntrl
 
       params_dim = external_dynamics_params.shape[1]
@@ -789,9 +821,9 @@ class TrajectoryGenerator(eqx.Module):
       )
 
       ############ Adaptation ##################
-      # # For now, just assume perfect knowledge with no noise
+      # Simulate noisy magnetometer measurement
       magnetometer_measurements = jax.lax.dynamic_slice(
-        external_dynamics_params,
+        external_dynamics_params + jrandom.normal(mag_key, shape=external_dynamics_params.shape) * 1e4,
         (i-history, 0), # uses history (no knowledge of future mag measurements)
         (history, params_dim),
         allow_negative_indices=False # will throw error if cond. not set up correctly which would allow it to use future measurements
@@ -840,15 +872,16 @@ class TrajectoryGenerator(eqx.Module):
         no_update,
         operand=(state, target_state, cntrl_key, dyn_params_est_slice, nominal_traj, nominal_cntrl)
       )
-      control_input, cntrl_param = low_level_controller(state, nominal_cntrl[i % replan_freq], nominal_traj[i % replan_freq], dyn_params_slice[i % replan_freq], cntrl_param)
+      # control_input, cntrl_param = low_level_controller(state, target_state, cntrl_key, dyn_params_slice[i % replan_freq], nominal_traj, nominal_cntrl, cntrl_param)
+      control_input, cntrl_param = low_level_controller(state, nominal_cntrl[0], nominal_traj[0], dyn_params_slice[i % replan_freq], cntrl_param)
       next_state = self.rk4_step(state, control_input, t_current, dyn_params_slice[0], rk4_key, noise_std)
       return (next_state, key, i+1, cntrl_param, nominal_traj, nominal_cntrl, mag_model), (state, control_input)
       
     # Run scan
-    init_nom_traj = jnp.tile(target_state,(high_level_controller.horizon+1,1))
+    init_nom_traj = jnp.tile(initial_state,(high_level_controller.horizon+1,1))
     key, init_cntrl_key = jrandom.split(key)
-    init_nom_cntrl = 0.01*jrandom.normal(init_cntrl_key, shape=((high_level_controller.horizon, self.dynamics.num_controls)))
-    init_cntrl_param = low_level_controller.Qf
+    init_nom_cntrl = 0.001*jrandom.normal(init_cntrl_key, shape=((high_level_controller.horizon, self.dynamics.num_controls)))
+    init_cntrl_param = low_level_controller.cntrl_param_init
     init_carry = (initial_state, key, 0, init_cntrl_param, init_nom_traj, init_nom_cntrl, self.dynamics.mag_model)
     
     (final_state, final_key, _, _, nominal_traj, nominal_cntrl, mag_model), (trajectory, controls) = jax.lax.scan(scan_step, init_carry, length=num_steps)
@@ -856,7 +889,7 @@ class TrajectoryGenerator(eqx.Module):
     # Add final state to end of trajectory
     trajectory = jnp.vstack([trajectory, final_state[None, :]])
   
-    return trajectory, controls, nominal_traj, nominal_cntrl
+    return trajectory, controls#, nominal_traj, nominal_cntrl
 
   @eqx.filter_jit
   def _generate_trajectory_batch_seq(self,
@@ -889,7 +922,7 @@ class TrajectoryGenerator(eqx.Module):
     
     plot_traj(dt, trajectory, controls, target_state, labels_states, labels_controls, legend, title)
 
-  def plot_costs(self, trajectory, target_state, title=None, legend=None):
+  def plot_costs(self, trajectory=None, target_state=None, df=None, batch_size=1, N = 100, angle_threshold=15.0, omega_threshold=5.0, time_max=None, title=None, legend=None, plot_stats=False,filename=None):
     """
     Plots quaternion and angular velocity costs over the horizon.
     Supports trajectory shapes: [N, nx] or [batch, N, nx]
@@ -897,18 +930,86 @@ class TrajectoryGenerator(eqx.Module):
     quat_start = self.dynamics.params.get("quat_start")
     dt = self.dt
 
-    plot_costs(dt, quat_start, trajectory, target_state, title, legend)
+    if df is None:
+      df = save_data_to_pd_df(trajectory, target_state, filename=None, labels=legend, dt=dt, quat_start=quat_start)
+      if trajectory.ndim == 2:
+          trajectory = trajectory[None, None, :, :]
+      elif trajectory.ndim == 3:
+          trajectory = trajectory[None, :, :, :]
+      
+      batch_size = trajectory.shape[1]
+      N = trajectory.shape[2]
+
+    return plot_costs(df, batch_size, N, title=title, legend=legend, angle_threshold=angle_threshold, omega_threshold=omega_threshold, time_max=time_max, plot_stats=plot_stats,filename=filename)
   
 
-  def plot_hist(self, trajectories, target_states, quat_threshold, omega_threshold, bins=30, time_hist_max = None, quat_hist_max = None, omega_hist_max = None, legend = None, title = None):
+  def plot_kde(self, trajectories=None, target_states=None, df=None, batch_size=1, N = 100, angle_threshold=15.0, omega_threshold=5.0, angle_stability_tol=5.0, omega_stability_tol=5.0, tail_length=100, time_hist_max = None, angle_hist_max = None, omega_hist_max = None, legend = None, title = None, verbose=False, filename=None):
     """
     Plots histograms for Slew Time, Final Quat Error, and Final Omega Error.
     """
     dt = self.dt
     quat_start = self.dynamics.params.get("quat_start")
 
-    plot_hist(dt, quat_start,trajectories, target_states, quat_threshold, omega_threshold, bins, time_hist_max, quat_hist_max, omega_hist_max, legend, title)
-    
+    if df is None:
+      df = save_data_to_pd_df(trajectories, target_states, filename=None, labels=legend, dt=dt, quat_start=quat_start)
+      if trajectories.ndim == 2:
+          trajectories = trajectories[None, None, :, :]
+      elif trajectories.ndim == 3:
+          trajectories = trajectories[None, :, :, :]
+      
+      batch_size = trajectories.shape[1]
+      N = trajectories.shape[2]
+
+    stats_df = create_stats_df(df, batch_size, N, angle_stability_tol, omega_stability_tol, tail_length, labels=None)
+
+    if time_hist_max is None:
+        time_hist_max = df["Time"].max()
+    if angle_hist_max is None:
+        angle_hist_max = angle_threshold
+    if omega_hist_max is None:
+        omega_hist_max = omega_threshold
+
+    plot_kde(stats_df, angle_threshold, omega_threshold, time_hist_max, angle_hist_max, omega_hist_max, legend, title, verbose, filename)
+
+  def plot_violin_and_bar(self, trajectories=None, target_states=None, df_list=None, batch_size=1, N = 100, angle_threshold=15.0, omega_threshold=5.0, angle_stability_tol=5.0, omega_stability_tol=5.0, tail_length=100, time_hist_max = None, angle_hist_max = None, omega_hist_max = None, legend = None, dataset_labels=None, title = None, verbose=False, plot_bar_by_group=False, filename=None):
+    """
+    Plots histograms for Slew Time, Final Quat Error, and Final Omega Error.
+    """
+    dt = self.dt
+    quat_start = self.dynamics.params.get("quat_start")
+
+    if df_list is None:
+      df = save_data_to_pd_df(trajectories, target_states, filename=None, labels=legend, dt=dt, quat_start=quat_start)
+      df_list = [df]
+      if trajectories.ndim == 2:
+          trajectories = trajectories[None, None, :, :]
+      elif trajectories.ndim == 3:
+          trajectories = trajectories[None, :, :, :]
+      
+      batch_size = trajectories.shape[1]
+      N = trajectories.shape[2]
+
+    stats_df_list = []
+    if dataset_labels is None:
+      datasets = []
+    else:
+      datasets = dataset_labels
+      
+    for i in range(len(df_list)):
+      if dataset_labels is None:
+        datasets.append(f"Dataset_{i+1}")
+      stats_df_list.append(create_stats_df(df_list[i], batch_size, N, angle_stability_tol, omega_stability_tol, tail_length, labels=None))
+
+    if time_hist_max is None:
+        time_hist_max = df_list[0]["Time"].max()
+    if angle_hist_max is None:
+        angle_hist_max = angle_threshold
+    if omega_hist_max is None:
+        omega_hist_max = omega_threshold
+
+    plot_violin_and_bar(stats_df_list, angle_threshold, omega_threshold, time_hist_max, angle_hist_max, omega_hist_max, datasets, title, verbose, plot_bar_by_group, filename)
+
+
   def plot_3D(self, trajectory):
     """
     Plot 3D trajectories.

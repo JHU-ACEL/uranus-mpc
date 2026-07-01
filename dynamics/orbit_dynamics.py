@@ -69,7 +69,8 @@ class OrbitDynamics(Dynamics):
         state: jax.Array,
         control: jax.Array,
         t: float = 0.0,
-        external_param: Optional[jax.Array] = None) -> jax.Array:
+        external_param: Optional[jax.Array] = None,
+        disturbance_force: Optional[jax.Array] = jnp.array([0])) -> jax.Array:
         """
         Computes the time derivative of the state of the system.
 

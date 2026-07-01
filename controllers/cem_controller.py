@@ -141,7 +141,7 @@ class CemController(Controller):
                               target_states = x_goal,
                               key = traj_key,
                               batch_size = self.num_samples,
-                              noise_std = 0.0, #0.001, #jnp.array([0.001]*4 + [0.001]*3)
+                              noise_std = .001, #jnp.array([0.001]*4 + [0.005]*3)
         
                               num_steps = self.horizon,
                               external_dynamics_params = external_dynamics_params,
@@ -164,14 +164,14 @@ class CemController(Controller):
       # Get mean cost of elites
       cost = jnp.mean(costs[idx_elites])
   
-      return (new_mu, new_sigma,  key), carry #  [[ 1 ]] For running in closed loop
-      #return (new_mu, new_sigma,  key), (cost, elites, states_batch, elite_traj) # [[ 2 ]] Store all samples for debugging
+      #return (new_mu, new_sigma,  key), carry #  [[ 1 ]] For running in closed loop
+      return (new_mu, new_sigma,  key), cost#, states_batch, elite_traj) # [[ 2 ]] Store all samples for debugging
 
 
     # Run optimization
     init_carry = (mu, sigma, key)
-    (final_mu, final_sigma, final_key), _ = jax.lax.scan(scan_step, init_carry, length=self.num_iter) # [[ 1 ]]
-    #(final_mu, final_sigma, final_key), (costs, elite_cntrls, trajs, elite_trajs) = jax.lax.scan(scan_step, init_carry, length=self.num_iter) # [[ 2 ]]
+    #(final_mu, final_sigma, final_key), _ = jax.lax.scan(scan_step, init_carry, length=self.num_iter) # [[ 1 ]]
+    (final_mu, final_sigma, final_key), costs = jax.lax.scan(scan_step, init_carry, length=self.num_iter) # [[ 2 ]]
 
     final_u_nominal = jnp.clip(final_mu, self.control_limits[:, 0], self.control_limits[:, 1])
 
@@ -184,5 +184,5 @@ class CemController(Controller):
                                 external_dynamics_params = external_dynamics_params,
                                 control_sequence = final_u_nominal)
     
-    return best_states, best_controls # [[ 1 ]]
-    #return best_states, best_controls, costs, elite_cntrls, trajs, elite_trajs # [[ 2 ]]
+    #return best_states, best_controls # [[ 1 ]]
+    return best_states, best_controls, costs #, elite_cntrls#, trajs, elite_trajs # [[ 2 ]]

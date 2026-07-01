@@ -157,7 +157,9 @@ class MagneticFieldModel(eqx.Module):
 
   @eqx.filter_jit
   def generate_magnetometer_data(self, trajectory, dt, num_steps, key, noise_std, bias, batch_size=0):
-
+    '''
+    Generates magnetic field data in PCI coords [nT] with optional noise
+    '''
     if trajectory.ndim == 2:
       batched_traj = trajectory[jnp.newaxis, :, :]
     else:

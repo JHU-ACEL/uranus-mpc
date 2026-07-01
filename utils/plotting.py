@@ -5,54 +5,153 @@ import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import pandas as pd
+import pickle
 import seaborn as sns
+import pdb
 
 from dynamics.spacecraft_dynamics import q_left, q_conj
 
-def _euler_angle_error_core(q_current, q_goal):
-    """Core mathematical operations on 1D arrays of shape (4,)."""
-    q_curr_inv = q_conj(q_current)
-    delta_q = q_left(q_curr_inv) @ q_goal
+def save_data_to_pd_df(trajectories, target_states, filename=None, labels=None, dt=0.1, quat_start=0):
+  """ Save results from multiple different Monte Carlo sims to one Pandas dataframe """
+
+  # 1. Normalize dimensions to 4D: [groups, n_trajs, time_steps, state_dim]
+  if trajectories.ndim == 2:
+      trajectories = trajectories[None, None, :, :]
+  elif trajectories.ndim == 3:
+      trajectories = trajectories[None, :, :, :]
   
-    # Shortest path correction
-    delta_q = jnp.where(delta_q[0] < 0.0, -delta_q, delta_q)
-    
-    dw, dx, dy, dz = delta_q
-    
-    # Convert error quaternion to Euler angles (Z-Y-X sequence)
-    sinr_cosp = 2.0 * (dw * dx + dy * dz)
-    cosr_cosp = 1.0 - 2.0 * (dx * dx + dy * dy)
-    error_roll = jnp.atan2(sinr_cosp, cosr_cosp)
+  n_groups = trajectories.shape[0]
+  batch_size = trajectories.shape[1]
+  n_steps = trajectories.shape[2]
 
-    sinp = 2.0 * (dw * dy - dz * dx)
-    sinp = jnp.clip(sinp, -1.0, 1.0)
-    error_pitch = jnp.asin(sinp)
+  # horizon_N = trajectory.shape[1]
+  time = jnp.arange(n_steps) * dt
+  time_expanded = jnp.broadcast_to(time, (batch_size,n_steps))
 
-    siny_cosp = 2.0 * (dw * dz + dx * dy)
-    cosy_cosp = 1.0 - 2.0 * (dy * dy + dz * dz)
-    error_yaw = jnp.atan2(siny_cosp, cosy_cosp)
+  # Normalize target_states to 3D: [groups, n_trajs, state_dim]
+  if target_states.ndim == 1:
+      target_states = target_states[None, None, :]
+  elif target_states.ndim == 2:
+      target_states = target_states[None, :, :]
+
+  # 2. Process data and compile into Pandas DataFrame for Seaborn
+  all_data = []
+  
+  for g in range(n_groups):
+      trajs = trajectories[g]
+      # Match targets to this group
+      t_states = target_states[g] if target_states.shape[0] == n_groups else target_states[0]
+
+      # Calculate Costs
+      quats = trajs[:, :, quat_start:quat_start+4]
+      quat_goals = t_states[:, None, :4]
+      quat_costs = 1.0 - jnp.abs(jnp.sum(quat_goals * quats, axis=-1))
+
+      principal_rotation_angles = 2*jnp.arccos(jnp.abs(jnp.sum(quat_goals * quats, axis=-1)))*180/jnp.pi
+      
+      omegas = trajs[:, :, 4:]
+      omega_goals = t_states[:, None, 4:]
+      omega_norms = jnp.linalg.norm(omegas - omega_goals, axis=-1)*180/jnp.pi
+
+      if labels is None:
+        group_label = f"Group_{g+1}" if n_groups > 1 else "Trajectories"
+      else:
+        group_label = labels[g]
+      
+      # Append to DataFrame structure
+      df_group = pd.DataFrame({
+          "Group": group_label,
+          "Time": np.array(time_expanded.ravel()),
+          "Quaternion Errors": np.array(quat_costs.ravel()),
+          "Angle Errors": np.array(principal_rotation_angles.ravel()),
+          "Omega Errors": np.array(omega_norms.ravel()),
+      })
+      all_data.append(df_group)
+      
+  # Merge all groups into one DataFrame
+  df = pd.concat(all_data, ignore_index=True)
+  if filename is not None:
+    df.to_pickle('data/'+filename)
+  
+  return df
+
+def create_stats_df(df, batch_size, N, angle_tol, omega_tol, tail_length, labels=None):
+  n_groups = df["Group"].nunique()
+
+  # 2. Process data and compile into Pandas DataFrame for Seaborn
+  all_data = []
+  
+  for g in range(n_groups):
+    group = df["Group"].unique()[g]
+    time_vector = jnp.array(df.loc[df["Group"] == group]["Time"]).reshape((batch_size, N))
+    time_vector = time_vector[0]
+    dt = time_vector[1] - time_vector[0]
+    quat_costs = jnp.array(df.loc[df["Group"] == group]["Quaternion Errors"]).reshape((batch_size, N))
+    principal_rotation_angles = jnp.array(df.loc[df["Group"] == group]["Angle Errors"]).reshape((batch_size, N))
+    omega_norms = jnp.array(df.loc[df["Group"] == group]["Omega Errors"]).reshape((batch_size, N))
+    # Extract the "converged" trajs using the mean of the tail
+    final_omegas = jnp.mean(omega_norms[:, -tail_length:], axis=1, keepdims=True)
+    final_angles = jnp.mean(principal_rotation_angles[:, -tail_length:], axis=1, keepdims=True)
     
-    return jnp.stack([error_roll, error_pitch, error_yaw])
+    # 3. Condition: Is the distance from the *average* final value within the neighborhood?
+    cond = (jnp.abs(omega_norms - final_omegas) < omega_tol) & \
+           (jnp.abs(principal_rotation_angles - final_angles) < angle_tol)
+    
+    # 4. Backward accumulation to find where it *stays* within the neighborhood
+    mask = jnp.logical_and.accumulate(cond[:, ::-1], axis=1)[:, ::-1]
+    
+    # 5. Calculate indices and stability checks
+    stability_start_idx = jnp.argmax(mask, axis=1)
+    
+    # We use the tail_length as our minimum required stability steps to ensure 
+    # the sequence actually settled around this average for a meaningful duration.
+    min_stable_steps = tail_length 
+    ever_stable = jnp.sum(mask, axis=1) >= min_stable_steps
+    
+    slew_time = stability_start_idx * dt
+    
+    # 6. Apply NaNs for Seaborn plotting
+    slew_time_arr = np.array(slew_time, dtype=float) 
+    slew_time_arr[~np.array(ever_stable)] = np.nan
 
-# Automatically handles inputs of shapes:
-# (4,), (N, 4), or (B, N, 4) by defining the signature of the core inputs
-euler_angle_error = jnp.vectorize(
-    _euler_angle_error_core, 
-    signature='(4),(4)->(3)'
-)
+    if labels is None:
+      group_label = group
+    else:
+      group_label = labels[g]
+    
+    # Append to DataFrame structure
+    df_group = pd.DataFrame({
+      "Group": group_label,
+      "Slew Time": slew_time_arr,
+      "Final Quaternion Error": np.array(quat_costs[:, -1]),
+      "Final Angle Error": np.array(final_angles[:, -1]),
+      # "Final Angle Error": np.array(principal_rotation_angles[:, -1]),
+      "Final Omega Error": np.array(final_omegas[:, -1]),
+    })
+    all_data.append(df_group)
+
+  # Merge all groups into one DataFrame
+  stats_df = pd.concat(all_data, ignore_index=True)
+  
+  return stats_df
 
 def plot_traj(dt, trajectory, controls, target_state, labels_states, labels_controls, legend, title):
   # Ensure batch dimension exists
   if trajectory.ndim < 3:
       trajectory = jnp.expand_dims(trajectory, 0)
   n_traj = trajectory.shape[0]
-  
+
+  if target_state is not None:
+    if target_state.ndim < 2:
+      target_state = jnp.tile(target_state,(trajectory.shape[1],1))
+    
   # Optional controls
   if controls is not None and controls.ndim < 3:
       controls = jnp.expand_dims(controls, 0)
   
   # Colors for trajectories
-  colors = plt.cm.tab10(jnp.linspace(0.0, 1.0, n_traj))
+  # colors = plt.cm.tab10(jnp.linspace(0.0, 1.0, n_traj))
+  colors = sns.color_palette("deep", n_colors=max(n_traj, 1))
   
   num_states = trajectory.shape[2]
   num_controls = controls.shape[2] if controls is not None else 0
@@ -93,221 +192,313 @@ def plot_traj(dt, trajectory, controls, target_state, labels_states, labels_cont
   if title is not None:
     axes_list[0].set_title(title)
   plt.show()
-  
-def plot_costs(dt, quat_start, trajectory, target_state, title, legend):
-  """
-  Plots quaternion, angular velocity costs, and Euler error norms over time.
-  Supports trajectory shapes: [N, nx] or [batch, N, nx]
-  """
-  sns.set_theme(style="whitegrid", context="talk",font_scale=.8)
-  
-  if trajectory.ndim == 2:
-      trajectory = jnp.expand_dims(trajectory, 0)
-  
-  if target_state.ndim == 1:
-      target_state = jnp.expand_dims(target_state, 0)
-  
-  num_batches = trajectory.shape[0]
-  horizon_N = trajectory.shape[1]
-  time_vector = jnp.arange(horizon_N) * dt
 
-  colors = sns.color_palette("deep", n_colors=max(num_batches, 1))
-
-  # Extract tracking metrics
-  quats = trajectory[:, :, quat_start:quat_start+4]
-  quat_goals = target_state[:, None, :4]
-  
-  quat_costs = 1.0 - jnp.abs(jnp.sum(quat_goals * quats, axis=-1))
-  
-  euler_errors = euler_angle_error(quats, quat_goals)
-  euler_error_norm = jnp.linalg.norm(euler_errors, axis=-1)*180/jnp.pi
-
-  omegas = trajectory[:, :, 4:]
-  omega_goals = target_state[:, None, 4:]
-  omega_costs = jnp.linalg.norm(omegas - omega_goals, axis=-1)*180/jnp.pi
-
-  fig, ax = plt.subplots(2, 1, sharex=True, dpi=150)
-  
-  # Loop through each batch run
-  for b in range(num_batches):
-      # Parse legend labeling strategy
-      if legend is None:
-          lbl = None
-      elif isinstance(legend, (list, tuple, jnp.ndarray)):
-          # If a list of strings is passed, label each line explicitly
-          lbl = legend[b] if b < len(legend) else f"Run {b+1}"
-      else:
-          # If a single string is passed, label the first line only to avoid clutter
-          lbl = legend if b == 0 else None
-      
-      ax[0].plot(time_vector, quat_costs[b], label=lbl, color=colors[b], linewidth=2)
-      #ax[0].plot(time_vector, euler_error_norm[b], label=lbl, color=colors[b], linewidth=2)
-      ax[1].plot(time_vector, omega_costs[b], label=lbl, color=colors[b], linewidth=2)
-
-  ax[0].set_ylabel("Quaternion Cost\n$1 - |q^T q_d|$")
-  #ax[0].set_ylabel("$\\|\\theta_e\\|_2$ (deg)")
-  ax[1].set_ylabel("$\\|\\omega\\|_2$ (deg/s)")
-  ax[1].set_xlabel("Time (s)")
-
-  if title:
-      fig.suptitle(title, fontsize=14, fontweight='bold', y=0.98)
-    
-  for a in ax:
-      a.grid(True, linestyle="--", alpha=0.6)
-      sns.despine(ax=a, left=False, bottom=False)
-      
-      # Only render the legend block if handles exist on that specific axis
-      handles, labels = a.get_legend_handles_labels()
-      if legend is not None and len(labels) > 0:
-          a.legend(loc="upper right", frameon=True, facecolor="white", edgecolor="none")
-        
-  plt.tight_layout()
-  plt.show()
-
-def plot_hist(dt, quat_start, trajectories, target_states, quat_threshold, omega_threshold, bins, time_hist_max, quat_hist_max, omega_hist_max, legend, title):
+def plot_costs(df, batch_size, N, title, legend, angle_threshold, omega_threshold, time_max, plot_stats, filename):
     """
-    Plots KDE distributions for Slew Time, Final Quat Error, and Final Omega Error.
+    Plots aggregate statistics (Max, 95th, 50th, Mean) or all costs for all trajectories
+    Supports trajectory shapes: [N, nx] or [batch, N, nx]
+    """
+    n_groups = df["Group"].nunique()
+
+    for g in range(n_groups):
+        group = df["Group"].unique()[g]
+        time_vector = jnp.array(df.loc[df["Group"] == group]["Time"]).reshape((batch_size, N))
+        time_vector = time_vector[0]
+        quat_costs = jnp.array(df.loc[df["Group"] == group]["Quaternion Errors"]).reshape((batch_size, N))
+        angle_costs = jnp.array(df.loc[df["Group"] == group]["Angle Errors"]).reshape((batch_size, N))
+        omega_costs = jnp.array(df.loc[df["Group"] == group]["Omega Errors"]).reshape((batch_size, N))
+      
+        # Define shared labels and configurations to decouple the loop
+        metrics_info = [
+            {"data": angle_costs, "threshold": angle_threshold, "ylabel": "Angle (deg)", "suffix": "_angle"},
+            {"data": omega_costs, "threshold": omega_threshold, "ylabel": r"$\|\omega\|_2$ (deg/s)", "suffix": "_omega"}
+        ]
+
+        for idx, m in enumerate(metrics_info):
+            # Create a completely separate figure for each metric
+            fig, a = plt.subplots(figsize=(8, 4), dpi=150)
+            
+            if plot_stats:
+                blues_palette = sns.light_palette("steelblue", n_colors=4, reverse=False)
+                c_max = blues_palette[1]  
+                c_95  = blues_palette[2]  
+                c_50  = blues_palette[3]  
+                c_avg = "red"             
+                
+                data = m["data"]
+                mx = jnp.max(data, axis=0)
+                p95 = jnp.percentile(data, 95, axis=0)
+                p50 = jnp.percentile(data, 50, axis=0)
+                avg = jnp.mean(data, axis=0)
+                
+                a.fill_between(time_vector, 0, mx, color=c_max, alpha=0.3, label="Max error")
+                a.fill_between(time_vector, 0, p95, color=c_95, alpha=0.4, label="95th percentile")
+                a.fill_between(time_vector, 0, p50, color=c_50, alpha=0.2, label="50th percentile")
+                
+                a.plot(time_vector, mx, color=c_max, linewidth=1.5)
+                a.plot(time_vector, p95, color=c_95, linewidth=2.0)
+                a.plot(time_vector, p50, color=c_50, linewidth=2.5)
+                a.plot(time_vector, avg, color=c_avg, linewidth=2.5, label="Average")
+                
+                a.axhline(y=m["threshold"], color="black", linestyle="--", label=r"$\text{threshold}$")
+                
+            else:
+                colors = sns.color_palette("deep", n_colors=max(batch_size, 1))
+                for b in range(batch_size):
+                    lbl = legend[b] if isinstance(legend, (list, tuple, jnp.ndarray)) and b < len(legend) else (legend if b == 0 else None)
+                    a.plot(time_vector, m["data"][b], label=lbl, color=colors[b], linewidth=2)
+        
+            # Styling and housekeeping per independent plot
+            a.set_ylabel(m["ylabel"])
+            a.set_xlabel("Time (seconds)")
+        
+            if title:
+                a.set_title(title, fontsize=14, fontweight='bold', y=1.02)
+              
+            a.grid(True, linestyle="-", alpha=0.15)
+            sns.despine(ax=a)
+            if time_max is None:
+              a.set_xlim([time_vector[0], time_vector[-1]])
+            else:
+              a.set_xlim([time_vector[0], time_max])
+            a.set_ylim(bottom=0)
+            
+            handles, labels = a.get_legend_handles_labels()
+            by_label = dict(zip(labels, handles))
+            if len(by_label) > 0:
+                a.legend(by_label.values(), by_label.keys(), loc="upper right", frameon=True, framealpha=0.95, edgecolor="black")
+            
+            plt.tight_layout()
+            if filename is not None:
+              plt.savefig('figures/' + 'costs_'+ group.lower() + m["suffix"] +  '_' + filename)
+            plt.show()
+
+    return df
+
+def plot_kde(stats_df, angle_threshold, omega_threshold, time_hist_max, angle_hist_max, omega_hist_max, legend, title, verbose, filename):
+    """
+    Plots KDE distributions for Slew Time, Final Quat Error, and Final Omega Error as individual figures.
     Supports single trajectory arrays or a stacked array of multiple groups.
     """
-    sns.set_context("talk", font_scale=1.1)
-    sns.set_style("whitegrid") 
-    # 1. Normalize dimensions to 4D: [groups, n_trajs, time_steps, state_dim]
-    if trajectories.ndim == 2:
-        trajectories = trajectories[None, None, :, :]
-    elif trajectories.ndim == 3:
-        trajectories = trajectories[None, :, :, :]
+    n_groups = stats_df["Group"].nunique()
+    kde_kwargs = {"hue": "Group", "fill": True, "common_norm": False, "warn_singular": False, "alpha": 0.5}
     
-    n_groups = trajectories.shape[0]
-
-    # Normalize target_states to 3D: [groups, n_trajs, state_dim]
-    if target_states.ndim == 1:
-        target_states = target_states[None, None, :]
-    elif target_states.ndim == 2:
-        target_states = target_states[None, :, :]
-
-    if time_hist_max is None:
-        time_hist_max = trajectories.shape[2]  # Note: index 2 is time dim in 4D
-    if quat_hist_max is None:
-        quat_hist_max = quat_threshold
-    if omega_hist_max is None:
-        omega_hist_max = omega_threshold
-
-    # 2. Process data and compile into Pandas DataFrame for Seaborn
-    all_data = []
-    
-    for g in range(n_groups):
-        trajs = trajectories[g]
-        # Match targets to this group
-        t_states = target_states[g] if target_states.shape[0] == n_groups else target_states[0]
-
-        # Calculate Costs
-        quats = trajs[:, :, quat_start:quat_start+4]
-        quat_goals = t_states[:, None, :4]
-        quat_costs = 1.0 - jnp.abs(jnp.sum(quat_goals * quats, axis=-1))
-
-        euler_errors = euler_angle_error(quats, quat_goals)
-        euler_error_norms = jnp.linalg.norm(euler_errors, axis=-1)*180/jnp.pi
-        
-        omegas = trajs[:, :, 4:]
-        omega_goals = t_states[:, None, 4:]
-        omega_norms = jnp.linalg.norm(omegas - omega_goals, axis=-1)*180/jnp.pi
-
-        # Stability Logic
-        cond = (omega_norms < omega_threshold) & (quat_costs < quat_threshold)
-        mask = jnp.logical_and.accumulate(cond[:, ::-1], axis=1)[:, ::-1]
-        
-        stability_start_idx = jnp.argmax(mask, axis=1)
-        ever_stable = jnp.any(mask, axis=1)
-        slew_time = stability_start_idx * dt
-        
-        # Replace non-stable slew times with NaN so Seaborn ignores them
-        slew_time_arr = np.array(slew_time)
-        slew_time_arr[~np.array(ever_stable)] = np.nan
-
-        if legend is None:
-          group_label = f"Group {g+1}" if n_groups > 1 else "Trajectories"
-        else:
-          group_label = legend[g]
-        
-        # Append to DataFrame structure
-        df_group = pd.DataFrame({
-            "Group": group_label,
-            "Slew Time (s)": slew_time_arr,
-            "Final Quaternion Error": np.array(quat_costs[:, -1]),
-            "Final Angle Error": np.array(euler_error_norms[:, -1]),
-            "Final Omega Error": np.array(omega_norms[:, -1])
-        })
-        all_data.append(df_group)
-
-        # Analytics Output per group
-        success_rate = jnp.mean(ever_stable) * 100
-        num_clipped_time = jnp.sum((slew_time > time_hist_max) & ever_stable)
-        # num_clipped_euler = jnp.sum(euler_error_norms[:, -1] > euler_hist_max)
-        num_clipped_quat = jnp.sum(quat_costs[:, -1] > quat_hist_max)
-        num_clipped_omega = jnp.sum(omega_norms[:, -1] > omega_hist_max)
-
-        print(f"--- {group_label} ---")
-        print(f"Success Rate: {success_rate:.2f}%")
-        print(f"  {num_clipped_time} successful trajs clipped from time plot")
-        # print(f"  {num_clipped_euler} trajs clipped from angle plot")
-        print(f"  {num_clipped_quat} trajs clipped from quat plot")
-        print(f"  {num_clipped_omega} trajs clipped from omega plot\n")
-
-    # Merge all groups into one DataFrame
-    df = pd.concat(all_data, ignore_index=True)
-
-    # 3. Plotting
-    fig, axs = plt.subplots(1, 3, figsize=(18, 5))
-    
-    # kwargs to keep seaborn plots consistent
-    kde_kwargs = {"hue": "Group", "fill": True, "common_norm": False, "warn_singular": False}
-
-    # Slew Time (ignoring NaNs)
-    sns.kdeplot(data=df, x="Slew Time (s)", ax=axs[0], clip=(0, time_hist_max), **kde_kwargs)
-    axs[0].set_xlabel("Time (s)")
-    axs[0].set_title(f"{title}: Slew Time" if title else "Slew Time")
-    axs[0].set_xlim(0, time_hist_max)
-
-    # Final Quat Error
-    sns.kdeplot(data=df, x="Final Quaternion Error", ax=axs[1], clip=(0, quat_hist_max), **kde_kwargs)
-    axs[1].set_xlabel(r"$||q_{\text{error}}||$")
-    axs[1].set_title("Final Quaternion Error")
-    axs[1].set_xlim(0, quat_hist_max)
-
-    # # Final Euler Angle Error
-    # sns.kdeplot(data=df, x="Final Angle Error", ax=axs[1], clip=(0, euler_hist_max), **kde_kwargs)
-    # axs[1].set_title("Final Angle Norm")
-    # axs[1].set_xlabel(r"$||\theta_e||$ (deg)")
-    # axs[1].set_xlim(0, euler_hist_max)
-
-    # Final Omega Error
-    sns.kdeplot(data=df, x="Final Omega Error", ax=axs[2], clip=(0, omega_hist_max), **kde_kwargs)
-    axs[2].set_title("Final Angular Velocity Norm")
-    axs[2].set_xlabel(r"$||\omega||$ (deg/s)")
-    axs[2].set_xlim(0, omega_hist_max)
-
-
-    # Histograms (uncomment to see histograms instead of kde plots)
-    # sns.histplot(data=df, x="Slew Time (s)", ax=axs[0], hue="Group", kde=True, stat="count", common_norm=False)
-    # sns.histplot(data=df, x="Final Angle Error", ax=axs[1], hue="Group", kde=True, stat="count", common_norm=False)
-    # sns.histplot(data=df, x="Final Omega Error", ax=axs[2], hue="Group", kde=True, stat="count", common_norm=False)
-
-    for a in axs:
-        a.grid(axis='y', linestyle='--', alpha=0.4)
-        
-    # Clean up duplicate legends if multiple groups were plotted
-    if n_groups > 1:
-        legend = axs[2].get_legend()
-        if legend:
-            legend.set_title(None)
-        if axs[0].get_legend(): axs[0].get_legend().remove()
-        if axs[1].get_legend(): axs[1].get_legend().remove()
-    elif n_groups == 1: # Remove the "Group" legend altogether if only 1 trajectory was passed
-        for a in axs:
-            if a.get_legend(): a.get_legend().remove()
+    # --- Figure 1: Slew Time ---
+    fig1, ax1 = plt.subplots(figsize=(6, 5))
+    sns.kdeplot(data=stats_df, x="Slew Time", ax=ax1, legend=False, clip=(0, time_hist_max), **kde_kwargs)
+    ax1.set_xlabel("Time (s)")
+    #ax1.set_title(f"{title}: Slew Time" if title else "Slew Time")
+    ax1.set_xlim(0, time_hist_max)
     plt.tight_layout()
+    if filename is not None:
+        plt.savefig('figures/kde_slew_time_' + filename)
     plt.show()
 
+    # --- Figure 2: Final Principal Angle Error ---
+    fig2, ax2 = plt.subplots(figsize=(6, 5))
+    sns.kdeplot(data=stats_df, x="Final Angle Error", ax=ax2, legend=False, clip=(0, angle_hist_max), **kde_kwargs)
+    #ax2.set_title("Final Principal Angle Error")
+    ax2.set_xlabel(r"$\gamma_e$ (deg)")
+    ax2.set_xlim(0, angle_hist_max)
+    plt.tight_layout()
+    if filename is not None:
+        plt.savefig('figures/kde_angle_error_' + filename)
+    plt.show()
+
+    # --- Figure 3: Final Omega Error ---
+    fig3, ax3 = plt.subplots(figsize=(6, 5))
+    sns.kdeplot(data=stats_df, x="Final Omega Error", ax=ax3, clip=(0, omega_hist_max), **kde_kwargs)
+    #ax3.set_title("Final Angular Velocity Norm")
+    ax3.set_xlabel(r"$||\omega||$ (deg/s)")
+    ax3.set_xlim(0, omega_hist_max)
+    plt.tight_layout()
+    if filename is not None:
+        plt.savefig('figures/kde_omega_error_' + filename)
+    plt.show()
+
+    if verbose:
+        for g in range(n_groups):
+            group_label = stats_df["Group"].unique()[g]
+            final_angles = jnp.array(stats_df.loc[stats_df["Group"] == group_label]["Final Angle Error"])
+            final_omegas = jnp.array(stats_df.loc[stats_df["Group"] == group_label]["Final Omega Error"])
+            slew_time = jnp.array(stats_df.loc[stats_df["Group"] == group_label]["Slew Time"])
+            stable_trajs = ~jnp.isnan(slew_time)
+
+            successful_trajs = ((final_angles < angle_threshold) & (final_omegas < omega_threshold) & (stable_trajs))
+            stable_rate = jnp.mean(stable_trajs)*100
+            success_rate = jnp.mean(successful_trajs) * 100
+            print(f"--- {group_label} ---")
+            print(f"Success Rate: {success_rate:.2f}%")
+            print(f"Stable Rate: {stable_rate:.2f}%")
+            print(f"Mean Converged Angle Error: {jnp.mean(final_angles):.3f} deg")
+            print(f"Mean Final Angular Velocity: {jnp.mean(final_omegas):.3f} deg/s")
+
+def plot_violin_and_bar(stats_df_list, angle_threshold, omega_threshold, time_hist_max, angle_hist_max, omega_hist_max, dataset_labels, title, verbose, plot_bar_by_group, filename):
+    """
+    Plots Violin distributions for Slew Time, Final Quat Error, and Final Omega Error as individual figures.
+    Supports single trajectory arrays or a stacked array of multiple groups.
+    """
+    n_dfs = len(stats_df_list)
+    df_combined = pd.concat(stats_df_list, keys=dataset_labels)
+    stats_df = df_combined.reset_index()
+    stats_df = stats_df.rename(columns={'level_0': 'Dataset'}).drop(columns=['level_1'], errors='ignore')
+      
+    n_groups = stats_df["Group"].nunique()
+
+    if n_dfs > 1:
+        violin_kwargs = {"x": "Group", "hue": "Dataset", "cut": 0, "legend": True}#, "inner": "quartile"} 
+    else:
+        violin_kwargs = {"x": "Group", "hue": "Group", "cut": 0, "legend": False}#, "inner": "quartile"}
+
+    # Helper function to reduce styling redundancies across independent violins
+    def finalize_violin_axes(ax):
+        ax.grid(axis='y', linestyle='--', alpha=0.4)
+        if n_groups == 1:
+            ax.set_xticks([])
+
+    # --- Figure 1: Slew Time ---
+    fig1, ax1 = plt.subplots(figsize=(6, 5))
+    sns.violinplot(data=stats_df, y="Slew Time", ax=ax1, **violin_kwargs)
+    ax1.set_ylabel("Time (s)")
+    ax1.set_xlabel("")
+    ax1.set_ylim(0, time_hist_max)
+    #ax1.set_title(f"{title}: Slew Time" if title else "Slew Time")
+    if n_dfs > 1: ax1.get_legend().set_title("")
+    finalize_violin_axes(ax1)
+    plt.tight_layout()
+    if filename is not None: plt.savefig('figures/violin_slew_' + filename)
+    plt.show()
+
+    # --- Figure 2: Final Principal Angle Error ---
+    fig2, ax2 = plt.subplots(figsize=(6, 5))
+    sns.violinplot(data=stats_df, y="Final Angle Error", ax=ax2, **violin_kwargs)
+    #ax2.set_title("Final Principal Angle Error")
+    ax2.set_ylabel(r"$\gamma_e$ (deg)")
+    ax2.set_xlabel("")
+    ax2.set_ylim(0, angle_hist_max)
+    if n_dfs > 1: ax2.get_legend().set_title("")
+    finalize_violin_axes(ax2)
+    plt.tight_layout()
+    if filename is not None: plt.savefig('figures/violin_angle_' + filename)
+    plt.show()
+
+    # --- Figure 3: Final Omega Error ---
+    fig3, ax3 = plt.subplots(figsize=(6, 5))
+    sns.violinplot(data=stats_df, y="Final Omega Error", ax=ax3, **violin_kwargs)
+    #ax3.set_title("Final Angular Velocity Norm")
+    ax3.set_ylabel(r"$||\omega||$ (deg/s)")
+    ax3.set_xlabel("")
+    ax3.set_ylim(0, omega_hist_max)
+    if n_dfs > 1: ax3.get_legend().set_title("")
+    finalize_violin_axes(ax3)
+    plt.tight_layout()
+    if filename is not None: plt.savefig('figures/violin_omega_' + filename)
+    plt.show()
+
+    # --- Collect Data for Success Rate & Mean Plots ---
+    success_data = []
+    grouped = stats_df.groupby(["Dataset", "Group"], sort=False)
+    for (dataset_label, group_label), group_data in grouped:
+        final_angles = jnp.array(group_data["Final Angle Error"].values)
+        final_omegas = jnp.array(group_data["Final Omega Error"].values)
+        slew_time    = jnp.array(group_data["Slew Time"].values)
+        stable_trajs = ~jnp.isnan(slew_time)
+
+        successful_trajs = ((final_angles < angle_threshold) & (final_omegas < omega_threshold) & (stable_trajs))
+        stable_rate = jnp.mean(stable_trajs) * 100
+        success_rate = jnp.mean(successful_trajs) * 100
+        
+        mean_angle_error = jnp.mean(final_angles)
+        mean_omega_error = jnp.mean(final_omegas)
+        
+        # Store metrics for plotting
+        success_data.append({
+            "Dataset": dataset_label, 
+            "Group": group_label, 
+            "Success Rate": float(success_rate),
+            "Mean Angle Error": float(mean_angle_error),
+            "Mean Omega Error": float(mean_omega_error)
+        })
+
+        if verbose:
+          print(f" ---- {dataset_label} | {group_label} ---- ")
+          print(f"Success Rate: {success_rate:.2f}%")
+          print(f"Stable Rate: {stable_rate:.2f}%")
+          print(f"Mean Converged Angle Error: {mean_angle_error:.3f} deg")
+          print(f"Mean Final Angular Velocity: {mean_omega_error:.3f} deg/s")
+          print("")
+
+    # --- Convert collected stats to DataFrame ---
+    success_df = pd.DataFrame(success_data)
+    bar_kwargs = {"x": "Group", "hue": "Dataset" if n_dfs > 1 else "Group", "legend": n_dfs > 1}
+
+    # --- Figure 4: Success Rate Bar Plot ---
+    fig4, ax4 = plt.subplots(figsize=(10, 5))
+    sns.barplot(data=success_df, y="Success Rate", ax=ax4, **bar_kwargs)
+    ax4.set_ylabel("Success Rate (%)")
+    ax4.set_xlabel("")
+    ax4.set_ylim(0, 100)
+    if n_dfs > 1: ax4.get_legend().set_title("")
+    finalize_violin_axes(ax4)
+    plt.tight_layout()
+    if filename is not None: plt.savefig('figures/bar_success_' + filename)
+    plt.show()
+
+    if plot_bar_by_group:
+      # --- Figure 5: Success Rate Bar Plot by Group ---
+      # --- Individual Group Success Rate Bar Plots ---
+      for target_group in success_df["Group"].unique():
+          group_df = success_df[success_df["Group"] == target_group]
+          
+          fig_g, ax_g = plt.subplots(figsize=(10, 5))
+          
+          # Keep y and hue the same; x is just the single group
+          sns.barplot(
+              data=group_df, 
+              x="Group", 
+              y="Success Rate", 
+              hue="Dataset" if n_dfs > 1 else "Group", 
+              ax=ax_g
+          )
+          
+          ax_g.set_ylabel("Success Rate (%)")
+          ax_g.set_xlabel("")
+          ax_g.set_xticks([]) # Removes the single x-tick label for a cleaner look
+          ax_g.set_ylim(0, 100)
+          #ax_g.set_title(f"Success Rate: {target_group}")
+          
+          if n_dfs > 1: 
+              ax_g.get_legend().set_title("")
+              
+          finalize_violin_axes(ax_g)
+          plt.tight_layout()
+          
+          if filename is not None: 
+              plt.savefig(f'figures/bar_success_{target_group}_' + filename)
+          plt.show()
+
+    # # --- Figure 5: Mean Final Angle Error Bar Plot ---
+    # fig5, ax5 = plt.subplots(figsize=(10, 5))
+    # sns.barplot(data=success_df, y="Mean Angle Error", ax=ax5, **bar_kwargs)
+    # ax5.set_ylabel(r"Mean $\gamma_e$ (deg)")
+    # ax5.set_xlabel("")
+    # if n_dfs > 1: ax5.get_legend().set_title("")
+    # finalize_violin_axes(ax5)
+    # plt.tight_layout()
+    # if filename is not None: plt.savefig('figures/bar_angle_error_' + filename)
+    # plt.show()
+
+    # # --- Figure 6: Mean Final Omega Error Bar Plot ---
+    # fig6, ax6 = plt.subplots(figsize=(10, 5))
+    # sns.barplot(data=success_df, y="Mean Omega Error", ax=ax6, **bar_kwargs)
+    # ax6.set_ylabel(r"Mean $||\omega||$ (deg/s)")
+    # ax6.set_xlabel("")
+    # if n_dfs > 1: ax6.get_legend().set_title("")
+    # finalize_violin_axes(ax6)
+    # plt.tight_layout()
+    # if filename is not None: plt.savefig('figures/bar_omega_error_' + filename)
+    # plt.show()
+  
 def plot_3D(trajectory):
   """
   Plot 3D trajectories.

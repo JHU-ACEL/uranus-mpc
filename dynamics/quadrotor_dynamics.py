@@ -10,6 +10,7 @@ import jax.numpy as jnp
 from copy import deepcopy
 
 from .base_dynamics import Dynamics
+from .quaternion_functions import S, q_left, q_conj, get_rotation, q_to_mrp, mrp_to_q
 
 quadrotor_parameters: Dict[str, Any] = {
     "num_states": 13,
@@ -36,45 +37,6 @@ quadrotor_dynamics_parameters = {
     "mass": 0.1,
     "inertia": jnp.array([0.1, 0.01, 0.01, 0.01, 0.1, 0.01, 0.01, 0.01, 0.1]),
 }
-
-
-# Skew symmetric map (lie algebra of SO(3), solves a x b = S(a)b)
-def S(u):
-    return jnp.array([[0, -u[2], u[1]], [u[2], 0, -u[0]], [-u[1], u[0], 0]])
-
-
-# Left quaternion product (used in the quaternion dynamics)
-def q_left(q):
-    qw = q[0]
-    qv = q[1:]
-    qL_B = jnp.concatenate((-qv.reshape(1, -1), S(qv)), axis=0)
-    qL_A = jnp.concatenate((jnp.array([[0]]), qv.reshape(-1, 1)), axis=0)
-    qL = jnp.concatenate((qL_A, qL_B), axis=1)
-    for ii in range(4):
-        qL = qL.at[ii, ii].set(qw)
-    return qL
-
-
-# Conjugate quaternion (used in the quaternion dynamics)
-def q_conj(q):
-    return jnp.concatenate((q[:1], -q[1:]))
-
-
-# Convert the quaternion into a rotation (rotates vector r as:  r' = get_rotation(q) @ r)
-# converts vector from body -> inertial frame (use q_conj(q) as input to go from inertial -> body)
-def get_rotation(q):
-    qw, qx, qy, qz = q
-    qw2 = qw * qw
-    qx2 = qx * qx
-    qy2 = qy * qy
-    qz2 = qz * qz
-    return jnp.array(
-        [
-            [qw2 + qx2 - qy2 - qz2, 2 * (qx * qy - qw * qz), 2 * (qx * qz + qw * qy)],
-            [2 * (qx * qy + qw * qz), qw2 - qx2 + qy2 - qz2, 2 * (qy * qz - qw * qx)],
-            [2 * (qx * qz - qw * qy), 2 * (qy * qz + qw * qx), qw2 - qx2 - qy2 + qz2],
-        ]
-    )
 
 class QuadrotorDynamics(Dynamics):
     """Quadrotor dynamics class."""
